@@ -316,3 +316,177 @@ Risk concentrated in:
   `run_id` discipline must be airtight)
 
 Both surface in phase 1's smoke test.
+
+---
+
+# Status (as-built)
+
+Everything above is the original planning doc, kept for context. This
+section reflects what actually shipped. The build was done in four
+phases; all four are in the tree.
+
+## Layout
+
+```
+panoptes-modern/
+├── panoptes/      legacy Flask app — UNTOUCHED, kept as reference
+├── server/        FastAPI + SQLModel + aiosqlite (new)
+├── plugin/        snakemake-logger-plugin-panoptes (new)
+└── ui/            Vite + React + TS + Tailwind (new)
+```
+
+The doc proposed a single `panoptes_modern/server/` dir; we used three
+top-level siblings instead so the JS toolchain wasn't nested inside a
+Python package. The legacy `panoptes/` is unchanged and not used by
+the new stack — final cutover (renaming dirs, updating root
+`Dockerfile` / `setup.py`) hasn't happened yet.
+
+## What shipped vs the plan
+
+**Shipped:**
+- All 8 mirrored REST endpoints under `/api/v1/`, plus
+  `POST /ingest`, `GET /workflows/{id}/{stats,dag}`,
+  `GET /workflows/{id}/jobs/{job_id}/{events,log}`.
+- `snakemake-logger-plugin-panoptes`: buffered HTTP forwarder,
+  retry with backoff, `--logger panoptes --logger-panoptes-url ...`.
+- React UI: workflows list, workflow detail (rule-grouped progress,
+  recharts duration chart, jobs filters with URL-synced state, DAG
+  tab), job detail (event timeline + log preview).
+- DAG view: React Flow + dagre, color-coded by per-rule status,
+  click-to-filter the jobs table.
+- Live updates via WebSocket pub/sub (`/api/v1/ws/{wf_id}`); polling
+  stays at 2s as a safety net.
+- Built UI bundle is served by FastAPI at `/` via `StaticFiles` —
+  single `uvicorn` invocation, no separate web server.
+- 25 server tests, 7 plugin tests, all green. UI is `tsc --noEmit`
+  clean and builds to ~256 KB gzipped.
+
+**Deferred / not built:**
+- snakemake 7 `--wms-monitor` backcompat shim (decision: drop).
+- Auth (still none — single-user dev box assumption).
+- Multi-user / per-user scoping.
+- Run comparison (two runs side-by-side).
+- JSON export of a workflow tree.
+- Alembic migrations (schema bootstrap is `SQLModel.metadata.create_all()`
+  in lifespan — fine until the schema settles).
+
+**Stack deltas from the doc:**
+- Charts: doc said "recharts (or visx)" — we used **recharts** for the
+  duration histogram and **React Flow + dagre** for the DAG (better
+  click/select UX than visx for graph interaction).
+- shadcn/ui CLI: not actually invoked — hand-rolled the four
+  components we needed (`badge`, `card`, `progress`, `tabs`) so the
+  UI doesn't depend on the CLI's working directory layout. Same
+  `cn(clsx + tailwind-merge)` convention.
+- Snakemake: doc targeted 8.20+; current verification is on **9.13**.
+  See "Snakemake version quirks" below.
+
+## How to run
+
+```bash
+# 1. Server (defaults to ./panoptes.db; override via PANOPTES_DB_URL)
+cd server && pip install -e ".[dev]"
+PANOPTES_DB_URL="sqlite+aiosqlite:///$(pwd)/panoptes.db" \
+  uvicorn panoptes_server.main:app --host 127.0.0.1 --port 5050
+
+# 2. Plugin
+cd ../plugin && pip install -e .
+
+# 3. UI (only needed when iterating; the built bundle is served by the
+#    server out of server/src/panoptes_server/static/)
+cd ../ui && npm install && npm run build
+# or for hot reload during development:
+#   npm run dev      # talks to the running server via vite proxy
+
+# 4. Point any snakemake run at the server
+snakemake --logger panoptes \
+          --logger-panoptes-url http://127.0.0.1:5050 \
+          --cores 2
+```
+
+Then open `http://127.0.0.1:5050`. The "/docs" Swagger page is also
+useful for poking the API directly.
+
+## Open questions, resolved
+
+1. **Multi-user** — out of scope for v1 (decision deferred).
+2. **Deployment target** — local dev box. Cluster login node /
+   separate-host scenarios untested.
+3. **Persistence** — SQLite via aiosqlite. Migration to postgres
+   would be a connection-string change plus moving `metadata.create_all`
+   to alembic.
+4. **DAG payload size** — non-issue: the rulegraph is rule-level
+   (one node per rule, not per job), so even a 50-rule workflow is
+   <5 KB. One-shot upload at workflow start is fine.
+5. **SM7 backcompat** — dropped.
+
+## Snakemake version quirks (worth knowing before touching the plugin)
+
+These are the things that surfaced during smoke-testing on 9.13 and
+forced plugin code to compensate. They likely also apply to late 8.x
+but haven't been re-verified across the matrix.
+
+1. **`WORKFLOW_STARTED` / `WORKFLOW_DONE` are not delivered to logger
+   plugins** in the way the snakemake source suggests. The plugin
+   synthesizes both itself: a startup event at handler init (with
+   `snakemake.__version__`, `os.getcwd()`, and the Snakefile path
+   guessed from the cwd) and a completion event in `close()`. The
+   server has a fallback that marks a workflow `done` when an empty
+   batch arrives and all known jobs are `done`, in case the plugin is
+   killed before its synthetic completion event flushes.
+
+2. **`RULEGRAPH` event payload is nested**. Snakemake puts the
+   topology under `record.__dict__["rulegraph"]` as
+   `{"nodes": [...], "links": [...]}` (note: `links`, not `edges`,
+   and each link has both numeric `source`/`target` indices and
+   `sourcerule`/`targetrule` names). The plugin unwraps and renames
+   to `{nodes, edges}` on the wire so the server contract stays clean.
+
+3. **Field name inconsistency**: `JOB_INFO` and `JOB_ERROR` use
+   `jobid`; `JOB_FINISHED` uses `job_id` (with underscore);
+   `JOB_STARTED` uses `jobs` (a *list* of ids). The plugin handles
+   each individually and fans `JOB_STARTED` out into one ingest
+   event per id.
+
+4. **`needs_rulegraph=True` must be set on the handler** for snakemake
+   to compute and emit the rulegraph at all. The default is `False`.
+
+5. **`LogHandlerBase.__init__` does not chain into `logging.Handler.__init__`**,
+   so `_name` is never set and `Handler.close()` raises
+   `AttributeError`. Plugin calls `logging.Handler.__init__(self)`
+   explicitly in its constructor.
+
+## Test infrastructure quirks (worth knowing before adding tests)
+
+1. **Async fixtures must dispose the engine on teardown**, otherwise
+   lingering aiosqlite connections block pytest's process exit
+   forever (looks like an infinite test). See
+   `server/tests/conftest.py` and `server/tests/test_ws.py` for the
+   pattern.
+
+2. **Don't use file-level `pytestmark = pytest.mark.asyncio`** in
+   files that mix sync (TestClient) and async (httpx AsyncClient)
+   tests — pytest-asyncio mis-runs the sync tests. Mark async tests
+   individually instead.
+
+3. **`from panoptes_server.db import _sessionmaker` captures `None`**
+   at import time and stays `None` even after lifespan initializes
+   the engine. Reference `db._sessionmaker` through the module so
+   live values are visible.
+
+## Where things live
+
+| Concern | File |
+|---|---|
+| Models / schema | `server/src/panoptes_server/models.py` |
+| Ingest event dispatch | `server/src/panoptes_server/services/ingest.py` |
+| Pub/sub bus | `server/src/panoptes_server/services/pubsub.py` |
+| Log tail + sandbox | `server/src/panoptes_server/services/log_tail.py` |
+| WS endpoint | `server/src/panoptes_server/routes/ws.py` |
+| Plugin entry / event mapping | `plugin/src/snakemake_logger_plugin_panoptes/__init__.py` |
+| UI route table | `ui/src/App.tsx` |
+| TanStack Query hooks | `ui/src/api/hooks.ts` |
+| WS subscriber hook | `ui/src/api/useWorkflowEvents.ts` |
+| DAG component | `ui/src/components/DagView.tsx` |
+| Workflow detail page | `ui/src/pages/WorkflowDetailPage.tsx` |
+
